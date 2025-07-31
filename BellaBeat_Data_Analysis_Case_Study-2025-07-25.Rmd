@@ -1,0 +1,1088 @@
+---
+title: "BellaBeat--Wellness Technology"
+author: "Michael Goldsmith"
+date: "2025-07-25"
+output: html_document
+---
+
+# BellaBeat Data Analysis/Case Study
+
+## Data Wrangling using both SQLite and R
+## Looking into fitness tracker data for insights
+
+### R Setup 
+
+```{r setup, include=TRUE}
+
+#tidyverse – R packages for data manipulation, visualization, and analysis using a consistent grammar.
+library(tidyverse)
+
+#dplyr – A grammar of data manipulation providing fast, intuitive tools for filtering, grouping, summarizing, and transforming data frames.
+library(dplyr)
+
+#lubridate – Simplifies working with dates and times in R by providing easy-to-use functions for parsing, manipulating, and formatting date-time objects.
+library(lubridate)
+
+#DBI – Provides a standardized interface for communication between R and various database management systems.
+library(DBI)
+
+#RSQLite – Implements the DBI interface specifically for SQLite databases, allowing you to manage SQLite data directly from R.
+library(RSQLite)
+
+#ggplot2 – A powerful data visualization package based on the grammar of graphics for creating elegant and customizable plots.
+library(ggplot2)
+
+#broom – Converts statistical model objects into tidy data frames, making model outputs easier to analyze and visualize.
+library(broom)
+
+#reshape2 – Provides tools for reshaping data between wide and long formats using functions like melt() and dcast().
+library(reshape2)
+
+#zoo – Offers infrastructure for working with ordered observations (regular and irregular time series) and includes rolling/moving average calculations.
+library(zoo)
+
+#fmsb – Provides functions for radar (spider) charts and other multivariate data visualizations.
+library(fmsb)
+
+library(factoextra)
+
+con <- dbConnect(RSQLite::SQLite(), dbname = "fitabase_data.db")
+```
+
+### Drop Tables for knitting (R)
+```{r}
+tables_to_drop <- c(
+  "daily_steps", "daily_heart_rate", "daily_sleep", 
+  "daily_weight", "daily_calories", 
+  "steps_heart", "steps_heart_sleep", 
+  "steps_heart_sleep_weight", "steps_heart_sleep_weight_calories",
+  "final_metrics", "final_metrics_df", "sleep_minutes_cleaned", "daily_intensity_summary"
+)
+
+for (tbl in tables_to_drop) {
+  dbExecute(con, paste0("DROP TABLE IF EXISTS ", tbl, ";"))
+}
+
+```
+
+
+### Create Daily Steps TEMP Table from hourly_steps Table (SQLite)
+Before importing things to this Markdown, I went through the data in excel. I found that daily_activity was missing a lot of data for each user id ("Id") compared to the hourly_steps table. So we're going aggregate hourly steps into daily steps table.
+
+```{sql connection=con}
+CREATE TEMP TABLE daily_steps AS
+SELECT 
+    Id,
+    substr(ActivityHour, 1, 9) AS ActivityDate,
+    SUM(StepTotal) AS DailyStepsTotal
+FROM hourly_steps
+GROUP BY Id, substr(ActivityHour, 1, 10)
+ORDER BY Id, ActivityDate;
+```
+
+### Check that New Table Exists (SQLite)
+
+```{sql connection=con}
+SELECT * FROM daily_steps LIMIT 1000;
+```
+
+### Analyzing and Cleaning up Heart Rate Data (SQLite)
+NOTES: The heart rate data was collected every 5 seconds, leading to way granular data. A more useful metric would be average heart rate, resting heart rate and maximum heart rate. 
+We also need to clean up the data-time from a string to a date. 
+
+```{sql connection=con}
+CREATE TEMP TABLE daily_heart_rate AS
+SELECT 
+    Id,
+    substr(Time, 1, instr(Time, ' ') - 1) AS ActivityDate,
+    ROUND(AVG(Value), 0) AS AvgHeartRate,
+    MAX(Value) AS MaxHeartRate,
+    MIN(Value) AS MinHeartRate
+FROM heartrate_seconds
+GROUP BY Id, ActivityDate
+ORDER BY Id, ActivityDate;
+
+```
+
+### Check on New Table daily_heart_rate (SQLite)
+
+```{sql connection=con}
+SELECT * From daily_heart_rate LIMIT 1000;
+```
+
+### Clean up Sleep_minutes table
+There are minutes that have a value of 2 or 3 in them, we need to correct those before adding them. 
+
+```{sql connection=con}
+CREATE TEMP TABLE sleep_minutes_cleaned AS
+SELECT
+  Id, 
+  Date, 
+  CASE
+    WHEN value IN (2,3) THEN 1
+    ELSE value
+  END AS value
+FROM minute_sleep;
+```
+
+### Get file into R Environment. 
+
+```{r}
+sleep_minutes_cleaned <- dbReadTable(con, "sleep_minutes_cleaned")
+head(sleep_minutes_cleaned)
+```
+
+
+### Aggregate Sleep Minutes into Daily Sleep.  (SQLite)
+NOTES: this requires we decide on our convention. What day do we assign a nights rest, the day the sleep began or the day in which it ended? Since we'll want the nights rest after activity, we'll assign the sleep total for an night spanning two days to the day the sleep start. 
+
+
+```{sql connection=con}
+CREATE TEMP TABLE daily_sleep AS
+SELECT
+    Id,
+    substr(Date, 1, instr(Date, ' ') - 1) AS ActivityDate,
+    COUNT(*) AS TotalSleepMinutes,
+    ROUND(COUNT(*) / 60.0, 2) AS TotalSleepHours
+FROM sleep_minutes_cleaned
+GROUP BY Id, substr(Date, 1, instr(Date, ' ') - 1)
+ORDER BY Id, ActivityDate;
+```
+
+### Check On daily_sleep Table (SQLite)
+
+```{sql connection=con}
+SELECT * FROM daily_sleep LIMIT 1000;
+```
+
+### Weight Table Cleaned (SQLite)
+
+```{sql connection=con}
+CREATE TEMP TABLE daily_weight AS
+SELECT
+    Id,
+    SUBSTR(Date, 1, INSTR(Date, ' ') - 1) AS ActivityDate,
+    ROUND(AVG(WeightKg), 1) AS AvgWeightKg,
+    ROUND(AVG(WeightPounds), 1) AS AvgWeightPounds,
+    ROUND(AVG(Fat), 1) AS AvgFat,
+    ROUND(AVG(BMI), 1) AS AvgBMI
+FROM weight_log
+GROUP BY Id, ActivityDate
+ORDER BY Id, ActivityDate;
+```
+
+### Check on New Table (SQLite)
+
+```{sql connection=con}
+SELECT * FROM daily_weight LIMIT 1000;
+```
+
+### Converting hourly_calories to Daily Calories (SQLite)
+
+```{sql connection=con}
+CREATE TEMP TABLE daily_calories AS 
+SELECT Id, 
+  SUBSTR(ActivityHour, 1, INSTR(ActivityHour, ' ') -1) AS ActivityDate, 
+  SUM(Calories) AS TotalDailyCalories, 
+  ROUND(AVG(Calories), 0) AS AvgHourlyCalories
+FROM hourly_calories
+GROUP BY Id, ActivityDate
+ORDER BY Id, ActivityDate;
+```
+
+### Check on New table daily_calories (SQLite)
+
+```{sql connection=con}
+SELECT * FROM daily_calories LIMIT 1000;
+```
+
+### Aggregate total intensity and Avg Daily Intensity into Daily Intensity
+
+```{sql connection=con}
+DROP TABLE IF EXISTS daily_intensity_summary;
+```
+
+
+```{r}
+dbExecute(con, "
+  CREATE TABLE daily_intensity_summary AS
+  SELECT 
+    Id, 
+    substr(ActivityHour, 1, instr(ActivityHour, ' ') - 1) AS ActivityDate,
+    SUM(TotalIntensity) AS DailyTotalIntensity, 
+    ROUND(AVG(AverageIntensity), 2) AS AvgHourlyIntensity
+  FROM hourly_intensities
+  GROUP BY Id, substr(ActivityHour, 1, instr(ActivityHour, ' ') - 1)
+  ORDER BY Id, ActivityDate;
+")
+
+# Load into R
+daily_intensity_summary <- dbReadTable(con, "daily_intensity_summary")
+
+# Convert string date to Date
+daily_intensity_summary <- daily_intensity_summary %>%
+  mutate(ActivityDate = as.character(ActivityDate)) %>%
+  mutate(ActivityDate = lubridate::mdy(ActivityDate))
+
+```
+
+
+### Trimming Date String daily_heart_rate (SQLite)
+
+```{sql connection=con}
+UPDATE daily_heart_rate
+SET ActivityDate = TRIM(ActivityDate);
+```
+
+### Trimming Date String daily_calories (SQLite)
+
+```{sql connection=con}
+UPDATE daily_calories
+SET ActivityDate = TRIM(ActivityDate);
+```
+
+### Trimming Date String daily_steps (SQLite)
+
+```{sql connection=con}
+UPDATE daily_steps
+SET ActivityDate = TRIM(ActivityDate);
+```
+
+### Trimming Date String daily_weight (SQLite)
+
+```{sql connection=con}
+UPDATE daily_weight
+SET ActivityDate = TRIM(ActivityDate);
+```
+
+### Trimming Date String daily_sleep (SQLite)
+
+```{sql connection=con}
+UPDATE daily_sleep
+SET ActivityDate = TRIM(ActivityDate);
+```
+
+### Checking for Duplicates Entries of Distinct Formats in daily_steps (SQLite)
+NOTES: I'm looking for situations like 4/01/2016 next to 4/1/2016, for example. 
+
+```{sql connection=con}
+SELECT DISTINCT ActivityDate
+FROM daily_steps
+ORDER BY Activitydate;
+```
+
+### Checking for Duplicates Entries of Distinct Formats in daily_heart_rate (SQLite)
+NOTES: I'm looking for situatons like 4/01/2016 next to 4/1/2016, for example. 
+
+```{sql connection=con}
+SELECT DISTINCT ActivityDate
+FROM daily_heart_rate
+ORDER BY Activitydate;
+```
+
+### Checking for Duplicates Entries of Distinct Formats in daily_sleep (SQLite)
+NOTES: I'm looking for situatons like 4/01/2016 next to 4/1/2016, for example.
+
+```{sql connection=con}
+SELECT DISTINCT ActivityDate
+FROM daily_sleep
+ORDER BY Activitydate;
+```
+
+### Checking for Duplicates Entries of Distinct Formats in daily_weight (SQLite)
+NOTES: I'm looking for situations like 4/01/2016 next to 4/1/2016, for example. 
+
+```{sql connection=con}
+SELECT DISTINCT ActivityDate
+FROM daily_weight
+ORDER BY Activitydate;
+```
+
+### Checking for Duplicates Entries of Distinct Formats in daily_calories (SQLite)
+NOTES: I'm looking for situations like 4/01/2016 next to 4/1/2016, for example. 
+
+```{sql connection=con}
+SELECT DISTINCT ActivityDate
+FROM daily_calories
+ORDER BY Activitydate;
+```
+
+### LEft Join onto daily_steps with daily_heart_rate --> steps_heart (SQLite)
+
+```{sql connection=con}
+CREATE TEMP TABLE steps_heart AS
+SELECT
+    s.Id,
+    s.ActivityDate,
+    s.DailyStepsTotal,
+    h.AvgHeartRate,
+    h.MaxHeartRate,
+    h.MinHeartRate
+FROM daily_steps s
+LEFT JOIN daily_heart_rate h
+    ON s.Id = h.Id AND s.ActivityDate = h.ActivityDate
+ORDER BY s.Id, s.ActivityDate;
+```
+
+### Left Join steps_heart to daily_sleep --> steps_heart_sleep (SQLite)
+
+```{sql connection=con}
+
+CREATE TEMP TABLE steps_heart_sleep AS
+SELECT
+    sh.*,
+    sl.TotalSleepHours
+FROM steps_heart sh
+LEFT JOIN daily_sleep sl
+    ON sh.Id = sl.Id AND sh.ActivityDate = sl.ActivityDate
+ORDER BY sh.Id, sh.ActivityDate;
+```
+
+### Left Join steps_heart_sleep to daily_weight --> steps_heart_sleep_weight (SQLite)
+
+```{sql connection=con}
+CREATE TEMP TABLE steps_heart_sleep_weight AS
+SELECT
+    shs.*,
+    w.AvgWeightKg,
+    w.AvgWeightPounds, 
+    w.AvgBMI
+FROM steps_heart_sleep shs
+LEFT JOIN daily_weight w
+    ON shs.Id = w.Id 
+    AND shs.ActivityDate = w.ActivityDate
+ORDER BY shs.Id, shs.ActivityDate;
+```
+
+### Left Join steps_heart_sleep_weight to daily_calories --> final_metrics (SQLite)
+
+```{sql connection=con}
+CREATE TEMP TABLE steps_heart_sleep_weight_calories AS
+SELECT
+    shsw.*,
+    c.TotalDailyCalories
+FROM steps_heart_sleep_weight shsw
+LEFT JOIN daily_calories c
+    ON shsw.Id = c.Id 
+    AND shsw.ActivityDate = c.ActivityDate
+ORDER BY shsw.Id, shsw.ActivityDate;
+```
+
+### Left join steps_heart_sleep_weight_calories with daily_intensity_summary
+
+```{sql connection=con}
+CREATE TEMP TABLE final_metrics AS
+SELECT
+    shswc.*,
+    i.DailyTotalIntensity,
+    i.AvgHourlyIntensity
+FROM steps_heart_sleep_weight_calories shswc
+LEFT JOIN daily_intensity_summary i
+    ON shswc.Id = i.Id AND shswc.ActivityDate = i.ActivityDate
+ORDER BY shswc.Id, shswc.ActivityDate;
+```
+
+
+### Check final Table final_metrics
+
+```{sql connection=con}
+SELECT * FROM final_metrics LIMIT 10000;
+```
+
+### Checking Average Values by User Id. (SQLite)
+
+```{sql connection=con}
+SELECT Id,
+       AVG(DailyStepsTotal) AS AvgSteps,
+       AVG(AvgHeartRate) AS AvgHeartRate,
+       AVG(TotalSleepHours) AS AvgSleep,
+       AVG(TotalDailyCalories) AS AvgCalories,
+       AVG(AvgWeightPounds) AS AvgWeight,
+       AVG(DailyTotalIntensity) AS AvgTotalIntensity,
+       AVG(AvgHourlyIntensity) AS AvgAvgHourlyIntensity
+FROM final_metrics
+GROUP BY Id;
+
+```
+
+### Checking MIN and MAX of Activity Date (SQLite)
+NOTES: WE seems to have lost a couple days of data at the end, which is disappointing
+
+```{sql connection=con}
+SELECT MIN(ActivityDate) AS StartDate,
+    MAX(ActivityDate) AS EndDate
+  FROM final_metrics;
+```
+
+# VISUALIZATION Utilizing R
+
+### Read final_metrics Table into an R data frame (R)
+
+```{r}
+final_metrics_df <- dbReadTable(con, "final_metrics")
+```
+
+### Check dataframe (R)
+
+```{r}
+head(final_metrics_df)
+```
+
+```{r}
+glimpse(final_metrics_df)
+```
+
+
+### Convert Date <chr> type to Date (R)
+
+```{r}
+final_metrics_df <- final_metrics_df %>%
+  mutate(ActivityDate = mdy(ActivityDate))
+```
+
+
+
+# Looking at Calories vs Steps (R)
+### Here we begin a series of cross-section analysis (metrics vs metric) of the newly created data table. Looking back I believe I should have start with a time series analysis of each metric of interest. 
+
+```{r}
+ggplot(data = final_metrics_df, aes(x= DailyStepsTotal, y = TotalDailyCalories), color = Id) +
+  geom_point(alpha = 0.6) +
+  labs(title= "Steps vs Calories", x = "Daily Total Steps", y = "Total Daily Calories")
+```
+
+### Needs to be Differentiated by User (R)
+
+```{r}
+ggplot(final_metrics_df, aes(x=DailyStepsTotal, y = TotalDailyCalories)) + geom_point(color = "blue", size=0.5) +
+  facet_wrap(~Id) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(title = "Daily Calories vs Daily Steps", x = "Daily Steps", y = "Daily Calories") +
+  scale_y_continuous(breaks = scales::pretty_breaks(n=3)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Select subset of user for illustrating steps correlation to calories (R)
+NOTE: From the table above I can see that there is a positive trend, but this is too much data
+to share on a Dashboard. 
+* focus on specific users: 1644430081, 1927972279, 4020332650, 6775888955, 8053475328 and 8877689391
+* run a sequence of filters to isolate for DailyStepsTotal>0, TotalDailyCalories>0, and with these user IDs. 
+
+```{r}
+final_metrics_df %>%
+  filter(
+    TotalDailyCalories >0, 
+    !is.na(DailyStepsTotal),
+    !is.na(TotalDailyCalories),
+    Id %in% c(1644430081, 1927972279, 4020332650, 6775888955, 8053475328, 8877689391)
+  ) %>%
+  ggplot(aes(x = DailyStepsTotal, y = TotalDailyCalories)) +
+  geom_point(color = "blue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  facet_wrap(~Id) +
+  labs(title = "Daily Calories vs Daily Steps",
+       x = "Daily Steps",
+       y = "Total Daily Calories") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+# SLEEP INSIGHTS
+
+
+### Start with scatter plots of Sleep vs Daily Steps
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(TotalSleepHours), TotalSleepHours > 0, DailyStepsTotal > 0) %>%
+ggplot(aes(x = DailyStepsTotal, y = TotalSleepHours)) +
+  geom_point(alpha = 0.6) +
+  facet_wrap(~Id) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(title = "Daily Steps vs Hours of Sleep", x = "Daily Steps", y = "Sleep (hours)") +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+### Sleep AND Total Calorie Expendature (R)
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(TotalDailyCalories), TotalDailyCalories > 0, !is.na(TotalSleepHours), TotalSleepHours >0) %>%
+ggplot(aes(x = TotalDailyCalories, y = TotalSleepHours)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  facet_wrap(~Id) +
+  labs(title = "Daily Calories Expended vs Hours of Sleep",
+       x = "Calories Expended (kCal)",
+       y = "Total Sleep (hours)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Creating a Correlation Matrix
+NOTES: We're not finding strong correlations with our hypothesized metrics, so we're going to take a look at how all the values in the table correlate with each other. 
+
+```{r}
+final_metrics_df %>%
+  select(DailyStepsTotal, TotalDailyCalories, TotalSleepHours, 
+         AvgHeartRate, MaxHeartRate, MinHeartRate, 
+         AvgWeightPounds, AvgBMI, DailyTotalIntensity, AvgHourlyIntensity) %>%
+  filter(
+    !is.na(DailyStepsTotal), !is.na(TotalDailyCalories), !is.na(TotalSleepHours),
+    !is.na(AvgHeartRate), !is.na(MaxHeartRate), !is.na(MinHeartRate),
+    !is.na(DailyTotalIntensity), !is.na(AvgHourlyIntensity)
+  ) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  round(2)
+```
+
+### Create Correlation Matrix Heatmap
+
+```{r}
+final_metrics_df %>%
+  select(DailyStepsTotal, TotalDailyCalories, TotalSleepHours, 
+         AvgHeartRate, MaxHeartRate, MinHeartRate, 
+         AvgWeightPounds, AvgBMI, DailyTotalIntensity, AvgHourlyIntensity) %>%
+  filter(
+    !is.na(DailyStepsTotal), !is.na(TotalDailyCalories), !is.na(TotalSleepHours),
+    !is.na(AvgHeartRate), !is.na(MaxHeartRate), !is.na(MinHeartRate),
+    !is.na(DailyTotalIntensity), !is.na(AvgHourlyIntensity)
+  ) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  round(2) %>%
+  reshape2::melt() %>%
+  ggplot(aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1, 1),
+                       name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  labs(title = "Correlation Heatmap", x = "", y = "")
+```
+
+
+### Analysis of Corellation Heat Map
+
+The following showed Correlations worth looking into:
+
+* Avg Heart Rate and Total Sleep Hours were negatively correlated (-0.55)--higher avg HR = Less Sleep. 
+* Max Heart Rate and Avg Weight were negatively correlated (-0.40)--Higher heart rate = lower average weight.
+* Max Heart Rate and Total Daily Calories Burned were positively correlated (0.51)--high max HR = higher Calories. 
+* sleep hours and daily calories burned had slight negative correlation (-0.15)--higher calorie burn -> Less sleep.
+* Daily Intensity and Steps have a slight positive correlation of (0.24)-- higher intensity = more steps
+* Daily Intensity and Calories have a strong positive correlation of (0.64)-- higher intensity = inc calories burn
+* Daily Intensity and Sleep Hours have a slight negative correlation of (-0.33)-- higher intensity = less sleep
+* Daily Intensity & Max Heart Rate are correlated (as expected) @ (0.40) -- higher intensity = higher max HR
+
+### MaxHeartRate vs TotalDailyCalories
+NOTES: Max Heart Rate and Total sleep we're correlated (0.51)
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(MaxHeartRate), !is.na(TotalDailyCalories),
+         MaxHeartRate > 0, TotalDailyCalories > 0) %>%
+    ggplot(aes(x = MaxHeartRate, y = TotalDailyCalories)) +
+      geom_point(alpha = 0.6, color = "blue") +
+      geom_smooth(method = "lm", se = FALSE, color = "red") +
+      facet_wrap(~Id, scales = "free_y") +  # Each user gets their own panel
+      labs(title = "Max Heart Rate vs Total Daily Calories (All Users)",
+          x = "Max Heart Rate (bpm)",
+          y = "Total Daily Calories") +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+### Avg Heart Rate and Total Sleep 
+
+NOTES: Avg Heart Rate and Total Sleep Hours were negatively correlated (-.055)--higher avg HR = Less Sleep. 
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(AvgHeartRate), !is.na(TotalSleepHours),
+         AvgHeartRate > 0, TotalSleepHours > 0) %>%
+  ggplot(aes(x = AvgHeartRate, y = TotalSleepHours)) +
+    geom_point(alpha = 0.6, color = "blue") +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    facet_wrap(~Id, scales = "free_y") +  
+    labs(title = "Avg Heart Rate vs Total Sleep Hours",
+       x = "Avg. Heart Rate (bpm)",
+       y = "Total Sleep (Hr)") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Max Heart Rate and Avg Weight
+
+NOTES: Max Heart Rate and Avg Weight were negatively correlated (-.40)--Higher heart rate = lower average weight.
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(MaxHeartRate), !is.na(AvgWeightPounds),
+         MaxHeartRate > 0, AvgWeightPounds > 0) %>%
+  ggplot(aes(x = MaxHeartRate, y = AvgWeightPounds)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  facet_wrap(~Id, scales = "free_y") +  
+  labs(title = "Max Heart Rate vs Avg Weight",
+       x = "Max Heart Rate (bpm)",
+       y = "Avg Weight (Lbs)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Sleep Hours AND Daily Calories Burned (-0.15)
+
+NOTES: sleep hours and daily calories burned had slight negative correlation--higher calorie burn -> Less sleep
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(TotalSleepHours), !is.na(TotalDailyCalories),
+         TotalSleepHours > 0, TotalDailyCalories > 0) %>%
+  ggplot(aes(x = TotalDailyCalories, y = TotalSleepHours)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  facet_wrap(~Id, scales = "free_y") +  
+  labs(title = "Daily Calories Burned vs Sleep",
+       x = "Calories (kCal)",
+       y = "Sleep (Hrs)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+### Looking at Intensity & Calories (+0.64 correlation)
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(DailyTotalIntensity), !is.na(TotalDailyCalories),
+         DailyTotalIntensity > 0, TotalDailyCalories > 0) %>%
+  ggplot(aes(x = TotalDailyCalories, y = DailyTotalIntensity)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  facet_wrap(~Id, scales = "free_y") +  
+  labs(title = "Daily Calories Burned vs Intensity",
+       x = "Calories (kCal)",
+       y = "Intensity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+### Looking at Intensity & Sleep
+* Daily Intensity and Sleep Hours have a slight negative correlation of (-0.33)-- higher intensity = less sleep
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(DailyTotalIntensity), !is.na(TotalSleepHours),
+         DailyTotalIntensity > 0, TotalSleepHours > 0) %>%
+  ggplot(aes(x = DailyTotalIntensity, y = TotalSleepHours)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  facet_wrap(~Id, scales = "free_y") +  
+  labs(title = "Daily Sleep Hours vs Intensity",
+       x = "Intensity",
+       y = "Sleep (Hr)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+### Scatter with Regression Line (All USers Combines) Sleep vs Intensity
+NOTES: Looking at individual users didn't illustrate the correlation well. 
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(TotalSleepHours), !is.na(DailyTotalIntensity)) %>%
+  ggplot(aes(x = DailyTotalIntensity, y = TotalSleepHours)) +
+  geom_point(alpha = 0.3, color = "blue") +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(title = "Daily Sleep Hours vs Daily Intensity (All Users)",
+       x = "Daily Total Intensity",
+       y = "Sleep Hours") +
+  theme_minimal()
+```
+### BoxPlot of Sleep, Intensity
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(TotalSleepHours), !is.na(DailyTotalIntensity)) %>%
+  mutate(IntensityLevel = cut(DailyTotalIntensity, breaks = quantile(DailyTotalIntensity, probs = c(0, 0.33, 0.66, 1), na.rm = TRUE), label = c("Low", "Medium", "High"),
+  include_lowest = TRUE
+  )) %>%
+  filter(!is.na(IntensityLevel)) %>%
+  ggplot(aes(x = IntensityLevel, y = TotalSleepHours, fill - IntensityLevel)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.4) +
+  scale_fill_manual(values = c("Low" = "steelblue", "Medium" = "Orange", "High" = "firebrick")) +
+  labs( title = "Sleep Hours vs Intensity Levels", 
+        x = "Intensity Level", 
+        y = "Sleep Hours"
+        ) + 
+  theme_minimal()
+```
+
+### Summary Stats of Intensity vs Sleep
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(TotalSleepHours), !is.na(DailyTotalIntensity)) %>%
+  mutate(IntensityLevel = cut(DailyTotalIntensity, breaks = quantile(DailyTotalIntensity, probs = c(0, 0.33, 0.66, 1), na.rm = TRUE), labels = c("Low", "Medium", "High"), include.lowest = TRUE)) %>%
+  group_by(IntensityLevel) %>%
+  summarise(
+    AvgSleep = round(mean(TotalSleepHours, na.rm = TRUE), 2),
+    MedianSleep = round(median(TotalSleepHours, na.rm = TRUE), 2), 
+    IQR = round(IQR(TotalSleepHours, na.rm = TRUE), 2), 
+    Count = n(), 
+    .groups = "drop") %>%
+  print()
+  )
+```
+
+
+
+### Looking at Max HR vs Daily Intensitys
+* Daily Intensity and Max Heart Rate
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(DailyTotalIntensity), !is.na(MaxHeartRate),
+         DailyTotalIntensity > 0, MaxHeartRate > 0) %>%
+  ggplot(aes(x = DailyTotalIntensity, y = MaxHeartRate)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  facet_wrap(~Id, scales = "free_y") +  
+  labs(title = "Intensity vs Max HeartRate",
+       x = "Intensity",
+       y = "Max Heart Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+# Trend Analysis (Time Series)
+
+We should have done this earlier in the analysis, but lets look at Time vs Steps, Calories, Sleep, and Weight for each user. We'll draw from our table final_metrics_df. 
+
+### Time vs Steps
+
+Here we'll look at Time by date(day) vs steps to see if there are any trends. 
+
+```{r}
+ggplot(final_metrics_df, mapping = aes(x = ActivityDate, y=DailyStepsTotal)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  facet_wrap(~Id) + labs(title= "Activity Date (day) vs Total Steps", 
+                         x= "Date (day)", 
+                         y = "Total Steps") +
+  scale_y_continuous(breaks = scales::pretty_breaks(n=2)) +
+theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.text.y = element_text(size = 8))
+
+```
+
+### Time Series Aggregation
+
+Notes: In this case we'll average total daily steps across all users and plot this average vs day of the week. This will hopefully help elucidate any trends seen over days of the week. I assumed null or zero steps were when users failed to wear their device. 
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(DailyStepsTotal), DailyStepsTotal > 0) %>%
+  group_by(ActivityDate, Id) %>%
+  summarise(UserSteps = sum(DailyStepsTotal), .groups = "drop") %>%
+  mutate(Weekday = lubridate::wday(ActivityDate, label = TRUE)) %>%
+  group_by(Weekday) %>%
+  summarise(AvgSteps = mean(UserSteps), .groups = "drop") %>%
+  ggplot(aes(x = Weekday, y = AvgSteps)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(
+    title = "Average Daily Steps by Weekday (Active Users Only)",
+    x = "Day of the Week", 
+    y = "Average Steps"
+  )
+```
+
+### Bar Graph of activity level by steps vs each metric (Calories, Sleep, weight, AvgHR, MinHR, MaxHr,Avg Intensity, Avg Hourly Intensity) 
+
+
+```{r}
+final_metrics_df %>%
+  filter(DailyStepsTotal > 0) %>%
+  group_by(Id) %>%
+  summarise(
+    AvgSteps = mean(DailyStepsTotal, na.rm = TRUE),
+    AvgCalories = mean(TotalDailyCalories, na.rm = TRUE),
+    AvgSleepHours = mean(TotalSleepHours, na.rm = TRUE), 
+    AvgWeightPounds = mean(AvgWeightPounds, na.rm = TRUE), 
+    AvgHeartRate = mean(AvgHeartRate, na.rm = TRUE),
+    AvgMinHeartRate = mean(MinHeartRate, na.rm = TRUE),
+    AvgMaxHeartRate = mean(MaxHeartRate, na.rm = TRUE), 
+    AvgDailyTotalIntensity = mean(DailyTotalIntensity, na.rm = TRUE), 
+    AvgHourlyIntensity = mean(AvgHourlyIntensity, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    ActivityLevel = cut(
+      AvgSteps, 
+      breaks = unique(quantile(AvgSteps, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)),
+      labels = c("Low", "Medium", "High"),
+      include.lowest = TRUE
+    )
+  ) %>%
+  group_by(ActivityLevel) %>%
+  summarise(
+    across(
+      c(AvgSleepHours, AvgCalories, AvgWeightPounds,
+        AvgHeartRate, AvgMinHeartRate, AvgMaxHeartRate, 
+        AvgDailyTotalIntensity, AvgHourlyIntensity),
+      mean, na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    -ActivityLevel,
+    names_to = "Metric",
+    values_to = "Value"
+  ) %>%
+  mutate(ActivityLevel = factor(ActivityLevel, levels = c("Low", "Medium", "High"))) %>%
+  ggplot(aes(x = ActivityLevel, y = Value, fill = ActivityLevel)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(title = "Metric Averages by Activity Level", y = "Value", x = "Activity Level") +
+  theme_minimal()
+  
+```
+### Quick Analysis: 
+* The correlation with Activity Level by steps and Intensity metrics are expected. 
+* There's no relationship with Avg Weight lbs, it doesn't help this is not separate by Sex
+* Avg Calories Burned  incrases with Activity Level by steps. 
+* Avg Max heart rate increases with Activity Level by steps.
+* I was hoping to see a lower resting HR w/ Increased activity level, but none there. 
+
+### Looking into Acrtivity Level based on Intensity in Tertiles
+
+
+```{r}
+final_metrics_df %>%
+  filter(DailyTotalIntensity > 0) %>%
+  group_by(Id) %>%
+  summarise(
+    AvgSteps = mean(DailyStepsTotal, na.rm = TRUE),
+    AvgCalories = mean(TotalDailyCalories, na.rm = TRUE), 
+    AvgSleepHours = mean(TotalSleepHours, na.rm = TRUE),
+    AvgWeightPounds = mean(AvgWeightPounds, na.rm = TRUE),
+    AvgHeartRate = mean(AvgHeartRate, na.rm = TRUE), 
+    AvgMinHeartRate = mean(MinHeartRate, na.rm = TRUE), 
+    AvgMaxHeartRate = mean(MaxHeartRate, na.rm = TRUE), 
+    AvgDailyTotalIntensity = mean(DailyTotalIntensity, na.rm = TRUE), 
+    AvgHourlyIntensity = mean(AvgHourlyIntensity, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  { 
+    df <- .
+    intensity_thresholds <- quantile(df$AvgDailyTotalIntensity, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+    
+    print(paste0(
+      "Intensity Thresholds: Low < ", round(intensity_thresholds[2], 1),
+      ", Medium ", round(intensity_thresholds[2], 1), " - ", round(intensity_thresholds[3], 1),
+      ", High > ", round(intensity_thresholds[3], 1)
+    ))
+    
+    df %>%
+      mutate(
+        IntensityLevel = cut(
+          AvgDailyTotalIntensity, 
+          breaks = unique(intensity_thresholds),
+          labels = c("Low", "Medium", "High"),
+          include.lowest = TRUE
+        )
+      )
+  } %>%
+  group_by(IntensityLevel) %>%
+  summarise(
+    across(
+      c(AvgSteps, AvgSleepHours, AvgCalories, AvgWeightPounds, AvgHeartRate, 
+        AvgMinHeartRate, AvgMaxHeartRate, AvgHourlyIntensity),
+      mean, na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    -IntensityLevel,
+    names_to = "Metric",
+    values_to = "Value"
+  ) %>%
+  mutate(IntensityLevel = factor(IntensityLevel, levels = c("Low", "Medium", "High"))) %>%
+  ggplot(aes(x = IntensityLevel, y = Value, fill = IntensityLevel)) +
+  geom_col(position = "dodge") + 
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(
+    title = "Metric Averages by Intensity Level", 
+    y = "Value", 
+    x = "Intensity Level"
+  ) + 
+  theme_minimal()
+
+```
+### Analysis of results
+* Intensity Level Thresholds: Low < 233, Medium 233 - 354.7, High > 354.7"
+* Average Calories Burned increases with intensity level
+* Avg Max HR increases with intensity level
+* Avg MIn HR decreases with intensity level (I expected this with steps and didn't get it, but more active user have a lower resting heart rate) 
+* Avg Sleep Hours goes down with Intensity level
+* Avg Steps and Intensity are strongely correlated -- as expected
+* Avg Weight in Pounds goes down with Intensity level -- This is better correlated than steps & weight. 
+
+# Looking into Engagement
+
+### % days each user is actively using the device
+* Active day: DailyStepsTotal >0
+* Inactive Days : DailySteps Total = 0 OR NA
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(DailyStepsTotal)) %>%
+  group_by(Id, ActivityDate) %>%
+  summarise(
+    DailySteps = sum(DailyStepsTotal),
+    .groups = "drop"
+  ) %>%
+  group_by(Id) %>%
+  summarise(
+    TotalDays = n(),
+    ActiveDays = sum(DailySteps > 0),
+    ActivePercent = round((ActiveDays / TotalDays) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(ActivePercent))
+  
+```
+
+### Visualize Engagement
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(DailyStepsTotal)) %>%
+  group_by(Id) %>%
+  summarise(
+    TotalDays = n(), 
+    ActiveDays = sum(DailyStepsTotal >0),
+    ActivePercent = round((ActiveDays / TotalDays) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(ActivePercent)) %>%
+  ggplot(aes(x = reorder(Id, -ActivePercent), y = ActivePercent)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = paste0(ActivePercent, "%")),
+           angle = 90, hjust = 1, size = 3) +
+  labs(
+    title = "User Engagement: % of Active Days",
+    x = "User ID", 
+    y = "Active Days (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1))
+```
+### User Engagement Segmentation Based on Daily Steps Activity
+Here I Establish Engagement from ActiveDays/TotalDays to establish. Active Days were days w/o NA and >0 steps; grouped into 3 different groups High >80% ActiveDays, Moderate @ 50 - 80% ActiveDays, and Low <50% Active.
+
+```{r}
+final_metrics_df %>%
+  filter(!is.na(DailyStepsTotal)) %>%
+  group_by(Id) %>%
+  summarise(
+    TotalDays = n(),
+    ActiveDays = sum(DailyStepsTotal > 0), 
+    ActivePercent = round((ActiveDays / TotalDays) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    EngagementLevel = case_when(ActivePercent >= 80 ~ "High",
+                                ActivePercent >= 50 ~ "Moderate",
+                                TRUE ~ "Low"
+                                ), 
+    EngagementLevel = factor(EngagementLevel, levels = c("Low", "Moderate", "High"))
+  ) %>%
+  ggplot(aes(x = EngagementLevel, fill = EngagementLevel)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+  labs(
+    title = "User Segmentation by Engagement Level", 
+    x = "Engagement Level",
+    y = "Number of Users"
+  ) + 
+  theme_minimal()
+
+```
+
+### User Engagement vs. Wellness Metrics
+Here I binned the users by High, Moderate, and Low Engagement based on their percentage of active days, then we visualized their engagement level vs several health indicators. 
+
+```{r}
+final_metrics_df %>%
+  filter(DailyStepsTotal > 0 | !is.na(DailyStepsTotal)) %>%
+  group_by(Id) %>%
+  summarise(
+    AvgSteps = mean(DailyStepsTotal, na.rm = TRUE),
+    AvgCalories = mean(TotalDailyCalories, na.rm = TRUE),
+    AvgSleepHours = mean(TotalSleepHours, na.rm = TRUE),
+    MinHeartRate  = mean(MinHeartRate, na.rm = TRUE),
+    MaxHeartRate = mean(MaxHeartRate, na.rm = TRUE),
+    AvgDailyTotalIntensity = mean(DailyTotalIntensity, na.rm = TRUE),
+    AvgHourlyIntensity = mean(AvgHourlyIntensity, na.rm = TRUE),
+    ActiveDays = sum(DailyStepsTotal > 0, na.rm = TRUE),
+    TotalDays = n(),
+    ActivePercent = round((sum(DailyStepsTotal > 0, na.rm = TRUE) / n()) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    EngagementLevel = case_when(
+      ActivePercent < 50 ~ "Low",
+      ActivePercent < 80 ~ "Moderate",
+      TRUE ~ "High"
+    ),
+    EngagementLevel = factor(EngagementLevel, levels = c("Low", "Moderate", "High"))
+  ) %>%
+  pivot_longer(
+    cols = c(AvgSteps, AvgCalories, AvgSleepHours, MinHeartRate, MaxHeartRate, AvgDailyTotalIntensity, AvgHourlyIntensity),
+    names_to = "Metric",
+    values_to = "Value"
+  ) %>%
+  ggplot(aes(x = EngagementLevel, y = Value, fill = EngagementLevel)) + 
+  geom_col(position = "dodge") + 
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(
+    title = "Wellness Metrics by User Engagement Level", 
+    x = "Engagement Level", 
+    y = "Average Value"
+  ) + 
+  theme_minimal()
+```
+
+### Behavioral Clustering
+Discover natural grops in the 
+
+```{r}
+set.seed(42)
+
+# Step 1: Summarize per user
+final_metrics_df %>%
+  filter(DailyStepsTotal > 0 | !is.na(DailyStepsTotal)) %>%
+  group_by(Id) %>%
+  summarise(
+    AvgSteps = mean(DailyStepsTotal, na.rm = TRUE),
+    AvgCalories = mean(TotalDailyCalories, na.rm = TRUE),
+    AvgSleepHours = mean(TotalSleepHours, na.rm = TRUE),
+    MinHeartRate  = mean(MinHeartRate, na.rm = TRUE),
+    MaxHeartRate = mean(MaxHeartRate, na.rm = TRUE),
+    AvgDailyTotalIntensity = mean(DailyTotalIntensity, na.rm = TRUE),
+    AvgHourlyIntensity = mean(AvgHourlyIntensity, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(RowID = row_number()) -> user_summary_with_id
+
+# Step 2: Select only columns for clustering and drop NAs from that subset
+user_summary_with_id %>%
+  select(-Id) %>%
+  drop_na() %>%
+  mutate(across(-RowID, ~scale(.)[,1])) %>%
+  kmeans(centers = 3, nstart = 25) %>%
+  {\(k) tibble(RowID = as.integer(1:length(k$cluster)), Cluster = as.factor(k$cluster)) }() -> cluster_lookup
+
+# Step 3: Merge and summarize by cluster
+user_summary_with_id %>%
+  inner_join(cluster_lookup, by = "RowID") %>%
+  group_by(Cluster) %>%
+  summarise(across(where(is.numeric), ~round(mean(.x, na.rm = TRUE), 1))) %>%
+  print()
+```
+
